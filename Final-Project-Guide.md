@@ -282,3 +282,168 @@ scenarios:
 - `PUT /rules` (hot‑reload basic thresholds)
 
 ---
+
+## 6) Persistence
+### 6.1 PostgreSQL (DDL minimo)
+```sql
+CREATE TABLE events (
+  event_id        uuid PRIMARY KEY,
+  event_type      text NOT NULL,
+  event_version   text NOT NULL,
+  producer        text NOT NULL,
+  source          text NOT NULL,
+  correlation_id  uuid,
+  trace_id        uuid,
+  partition_key   text NOT NULL,
+  ts_utc          timestamptz NOT NULL,
+  zone            text,
+  geo_lat         numeric,
+  geo_lon         numeric,
+  severity        text,
+  payload         jsonb NOT NULL
+);
+CREATE INDEX idx_events_ts    ON events (ts_utc);
+CREATE INDEX idx_events_type  ON events (event_type);
+CREATE INDEX idx_events_zone  ON events (zone);
+CREATE INDEX idx_events_pkey  ON events (partition_key);
+
+CREATE TABLE alerts (
+  alert_id        uuid PRIMARY KEY,
+  correlation_id  uuid,
+  type            text NOT NULL,
+  score           numeric,
+  zone            text,
+  window_start    timestamptz,
+  window_end      timestamptz,
+  evidence        jsonb,    -- array of event_ids w/ minimal context
+  created_at      timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX idx_alerts_ts  ON alerts (created_at);
+CREATE INDEX idx_alerts_zone ON alerts (zone);
+```
+
+
+**Ejemplo de consulta (alertas en los ultimos 15 mins, por zona)**
+```sql
+SELECT zone, type, count(*) as cnt
+FROM alerts
+WHERE created_at > now() - interval '15 minutes'
+GROUP BY zone, type
+ORDER BY cnt DESC;
+```
+
+### 6.2 Elasticsearch (indices & mappings)
+- Index pattern: `events-*`, `alerts-*`
+- Map `geo` a `geo_point`, `timestamp` a `date`
+
+```json
+{
+  "mappings": {
+    "properties": {
+      "event_id":   { "type": "keyword" },
+      "event_type": { "type": "keyword" },
+      "timestamp":  { "type": "date"    },
+      "geo":        { "type": "geo_point" },
+      "severity":   { "type": "keyword" },
+      "payload":    { "type": "object", "enabled": true }
+    }
+  }
+}
+```
+
+> **Entregable A5:** index template JSON + screenshot de los documentos via `_search`.
+
+## 7) Airflow (Jobs Periodicos)
+
+- **Limpieza:** eliminar claves Redis obsoletas, compactar Postgres (vacuum/analyze).
+- **Métricas:** estadísticas diarias por tipo de evento/zona.
+- **Conjuntos de datos:** exportar positivos etiquetados/falsos positivos para experimentación.
+- **Programación:** `@hourly` (laboratorio).
+
+**DAG sketch (Python)**
+```python
+from airflow import DAG
+from airflow.operators.python import PythonOperator
+from datetime import datetime
+
+def compute_daily_metrics(): ...
+def cleanup_redis(): ...
+
+with DAG("perimeter_ops", start_date=datetime(2025,8,1), schedule="@hourly", catchup=False) as dag:
+    t1 = PythonOperator(task_id="metrics", python_callable=compute_daily_metrics)
+    t2 = PythonOperator(task_id="cleanup_redis", python_callable=cleanup_redis)
+    t1 >> t2
+```
+
+---
+
+## 8) Grafana (Dashboards)
+
+1. **Mapa de calor por zona**: recuento de `event_type` a lo largo del tiempo.
+2. **Cronología de alertas**: alertas/min por `type`.
+3. **Tabla de alertas activas**: las N más recientes con `zone`,`score`.
+4. **Desglose**: haga clic en la alerta → mostrar eventos de evidencia (a través de la vista Postgres o la consulta ES).
+
+**ES query (KQL)**: `event_type: "panic.button" AND geo.zone: "zone_4"`
+
+> **Entregable A6:** export del dashboard JSON + screenshot.
+
+---
+
+
+## 9) Testing & Smoke
+**Smoke test (bash)**
+```bash
+curl -s -X POST http://ingestor.local:8080/events \
+  -H 'content-type: application/json' \
+  -d '{"event_version":"1.0","event_type":"panic.button","event_id":"'$RANDOM'",
+       "producer":"curl","source":"simulated","correlation_id":"'$RANDOM'",
+       "trace_id":"'$RANDOM'","timestamp":"'$(date -u +%Y-%m-%dT%H:%M:%SZ)'",
+       "partition_key":"zone_4","geo":{"zone":"zone_4"},"severity":"critical",
+       "payload":{"tipo_de_alerta":"panico","identificador_dispositivo":"BTN-001"}}' \
+  -i
+```
+
+**Esperado:** `202 Accepted`, mensaje visible en `events.standardized`, persistence OK.
+
+**Artillery scenarios**: crear uno por tipo de sensor; agregar un **fase de ráfaga** (e.g., 100 rps for 10s) para testear la respuesta.
+
+---
+
+## 10) Observability & APM
+- **Logs estructurados** (JSON) con `trace_id`, `event_id`, `service`, `level`, `ts_utc`.
+- **Métricas**: tasa de ingesta, tasa de error de validación, latencia de publicación, retraso del consumidor, latencia de correlación, tasa de alertas.
+- **Seguimiento (opcional)**: Elastic APM/OpenTelemetry: propagar `trace_id` de extremo a extremo.
+
+---
+
+## 11) Estructura del equipo y hitos
+**Equipos**
+1. **Contrato/Esquema** (propietario del evento canónico + validadores)
+2. **Ingestor de eventos** (REST + DLQ)
+3. **Operaciones de Kafka** (topics, retention, ACL)
+4. **Correlador + Redis**
+5. **Persistencia (PG/ES)**
+6. **Grafana**
+7. **Airflow/Analytics**
+
+**Hitos**
+- **M0 :** Evento canónico 1.0 + Ingestor en funcionamiento.
+- **M1 :** Temas de Kafka + productores + consumidor a Postgres.
+- **M2 :** Correlator + Redis + `correlated.alerts`.
+- **M3 :** Paneles + Airflow + ajuste; demostración final.
+
+---
+
+
+## x) MVP checklist (lo que DEBE funcionar)
+- [ ] El ingestor recibe y valida el JSON canónico; publica en «events.standardized»
+- [ ] El correlador consume, utiliza la ventana Redis y publica en «correlated.alerts»
+- [ ] Alertas/eventos persistentes (PG/ES)
+- [ ] Grafana muestra alertas + mapa de calor
+- [ ] Prueba de ráfagas gestionada (almacenamiento en búfer a través de Kafka), sin pérdida de datos, seguimiento de DLQ
+
+
+
+
+
